@@ -6,7 +6,7 @@ gitignore ignores the data folder, please put the data there, do not commit huge
 
 ## Data
 Links:
-- Link for transeksta's dataset for technical inspections: https://get.data.gov.lt/datasets/gov/transeksta/ctadb/Apziura/:format/csv
+- Link for transeksta's dataset for technical insepctions: https://get.data.gov.lt/datasets/gov/transeksta/ctadb/Apziura/:format/csv
 
 ## Inspection failure model
 This repository includes a scalable training script that predicts failed technical inspection risk from:
@@ -80,4 +80,4 @@ python models/train_inspection_failure_model.py \
 
 ### What the output means
 - `predicted_failure_probability` close to `1.0` means the model expects a high chance of inspection failure.
-- The risk report ranks `vehicle_label` and mileage combinations that are most likely to fail.
+- The risk report ranks car model and mileage combinations that are most likely to fail.
