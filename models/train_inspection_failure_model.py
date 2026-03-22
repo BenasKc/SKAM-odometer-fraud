@@ -364,7 +364,7 @@ def train_incremental_model(
     y_pred = (fail_scores >= THRESHOLD).astype(int)
     f1 = f1_score(y_eval, y_pred, zero_division=0)
     fbeta = fbeta_score(y_eval, y_pred, beta=args.fbeta_beta, zero_division=0)
-    report_text = classification_report(y_eval, y_pred, digits=4)
+    report_text = classification_report(y_eval, y_pred, digits=4, zero_division=0)
 
     model_profiles: dict[str, dict[str, Union[float, str]]] = {}
     for model, count in model_counts.items():
