@@ -350,7 +350,16 @@ def train_incremental_model(
     y_eval = np.array(eval_labels)
 
     fail_scores = classifier.predict_proba(x_eval)[:, 1]
-    roc_auc = roc_auc_score(y_eval, fail_scores)
+    # Guard against single-class evaluation data, which makes ROC AUC undefined.
+    unique_classes = np.unique(y_eval)
+    if unique_classes.size < 2:
+        print(
+            "Warning: Evaluation set contains only a single class; "
+            "ROC AUC is undefined. Setting roc_auc to NaN."
+        )
+        roc_auc = float("nan")
+    else:
+        roc_auc = roc_auc_score(y_eval, fail_scores)
 
     y_pred = (fail_scores >= THRESHOLD).astype(int)
     f1 = f1_score(y_eval, y_pred, zero_division=0)
