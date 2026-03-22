@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a car inspection failure model using car model and mileage.
+"""Train a car inspection failure model using vehicle and technical features.
 
 This script is designed for very large CSV files and trains incrementally
 using chunked reads and SGD logistic regression.
@@ -11,7 +11,7 @@ import argparse
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Union
 
 import joblib
 import numpy as np
@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Train a model that predicts failed technical inspection risk "
-            "from car model and mileage."
+            "from vehicle label, mileage, year, fuel, and smokiness."
         )
     )
     parser.add_argument(
@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
         "--output-risk-report",
         type=Path,
         default=Path("models/high_risk_model_mileage_pairs.csv"),
-        help="Where to save the ranked high-risk model and mileage pairs.",
+        help="Where to save the ranked high-risk vehicle_label and mileage pairs.",
     )
     parser.add_argument(
         "--chunk-size",
@@ -209,7 +209,7 @@ def to_feature_dicts(
 
 def train_incremental_model(
     args: argparse.Namespace,
-) -> tuple[FeatureHasher, SGDClassifier, Counter, dict[str, dict[str, float | str]], TrainingMetrics]:
+) -> tuple[FeatureHasher, SGDClassifier, Counter, dict[str, dict[str, Union[float, str]]], TrainingMetrics]:
     hasher = FeatureHasher(n_features=2**18, input_type="dict", alternate_sign=False)
     classifier = SGDClassifier(
         loss="log_loss",
@@ -357,7 +357,7 @@ def train_incremental_model(
     fbeta = fbeta_score(y_eval, y_pred, beta=args.fbeta_beta, zero_division=0)
     report_text = classification_report(y_eval, y_pred, digits=4)
 
-    model_profiles: dict[str, dict[str, float | str]] = {}
+    model_profiles: dict[str, dict[str, Union[float, str]]] = {}
     for model, count in model_counts.items():
         if count <= 0:
             continue
@@ -392,7 +392,7 @@ def build_risk_ranking(
     hasher: FeatureHasher,
     classifier: SGDClassifier,
     model_counts: Counter,
-    model_profiles: dict[str, dict[str, float | str]],
+    model_profiles: dict[str, dict[str, Union[float, str]]],
     min_model_count: int,
     top_model_limit: int,
 ) -> pd.DataFrame:
@@ -427,7 +427,7 @@ def build_risk_ranking(
             fail_probability = float(classifier.predict_proba(x)[0, 1])
             records.append(
                 {
-                    "tp_modelis": model,
+                    "vehicle_label": model,
                     "tp_rida_km": mileage,
                     "predicted_failure_probability": round(fail_probability, 6),
                     "model_row_count": model_counts[model],
@@ -437,7 +437,7 @@ def build_risk_ranking(
     if not records:
         return pd.DataFrame(
             columns=[
-                "tp_modelis",
+                "vehicle_label",
                 "tp_rida_km",
                 "predicted_failure_probability",
                 "model_row_count",
