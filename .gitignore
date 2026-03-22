@@ -1,1 +1,3 @@
 /data/*
+models/high_risk_model_mileage_pairs.csv
+models/inspection_failure_model.joblib
