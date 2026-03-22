@@ -6,7 +6,7 @@ gitignore ignores the data folder, please put the data there, do not commit huge
 
 ## Data
 Links:
-- Link for transeksta's dataset for technical insepctions: https://get.data.gov.lt/datasets/gov/transeksta/ctadb/Apziura/:format/csv
+- Link for transeksta's dataset for technical inspections: https://get.data.gov.lt/datasets/gov/transeksta/ctadb/Apziura/:format/csv
 
 ## Inspection failure model
 This repository includes a scalable training script that predicts failed technical inspection risk from:
