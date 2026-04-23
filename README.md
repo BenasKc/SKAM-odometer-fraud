@@ -80,4 +80,4 @@ python models/train_inspection_failure_model.py \
 
 ### What the output means
 - `predicted_failure_probability` close to `1.0` means the model expects a high chance of inspection failure.
-- The risk report ranks `vehicle_label` and mileage combinations that are most likely to fail.
+- The risk report ranks car model and mileage combinations that are most likely to fail.
