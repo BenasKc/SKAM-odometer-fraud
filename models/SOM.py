@@ -2,14 +2,14 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
 from minisom import MiniSom
 np.random.seed(42)
 
 # ── Colours ───────────────────────────────────────────
-C_LEGIT = "#2196F3"   # blue  — normalus skelbimas
-C_FRAUD = "#F44336"   # red   — įtartinas skelbimas
+C_LEGIT = "#2196F3" # blue - normalus skelbimas
+C_FRAUD = "#F44336" # red - įtartinas skelbimas
 
 # ── Sizes ─────────────────────────────────────────────
 FIG_WIDE = (14, 5)
@@ -25,7 +25,7 @@ plt.rcParams["font.size"] = 11
 print("Style settings ready.")
 
 SOM_PARAMS = {
-    "map_size": 18,
+    "map_size": 20,
     "learning_rate": 0.1,
     "sigma": None,
     "iterations": None,
@@ -41,7 +41,7 @@ FRAUD_PARAMS = {
 
 df_raw = pd.read_csv(path)
 
-def clean_and_engineer(df):
+def clean(df):
     df = df.copy()
 
     df["price_eur"] = (
@@ -93,7 +93,8 @@ def clean_and_engineer(df):
 
     return df
 
-df_raw = clean_and_engineer(df_raw)
+df_raw = clean(df_raw)
+df_raw = df_raw[df_raw["price_eur"] < 80000].reset_index(drop=True)
 
 FEATURES = [
     "price_eur", "mileage_km", "engine_cc", "engine_hp",
@@ -118,7 +119,7 @@ df_train, df_test, X_train_raw, X_test_raw = train_test_split(
 df_train = df_train.reset_index(drop=True)
 df_test  = df_test.reset_index(drop=True)
 
-scaler  = StandardScaler()
+scaler  = MinMaxScaler()
 X_train = scaler.fit_transform(X_train_raw)
 X_test  = scaler.transform(X_test_raw)
 
@@ -195,7 +196,7 @@ suspect_test = som_dist_test > threshold_dist
 
 # U-Matrix ir atstumo pasiskirstymas
 fig, axes = plt.subplots(1, 2, figsize=FIG_WIDE)
-fig.suptitle("SOM: Klasteriai", fontweight="bold")
+fig.suptitle("SOM: Klasteriai (train)", fontweight="bold")
 
 ax = axes[0]
 im = ax.imshow(som.distance_map().T, cmap="bone_r", aspect="auto")
@@ -205,12 +206,39 @@ for x_pt, is_suspect in zip(X_train, suspect_train):
     ax.plot(bmu[0] + .5, bmu[1] + .5,
             "o", color=C_FRAUD if is_suspect else C_LEGIT,
             alpha=0.3, ms=4)
-ax.set_title("U-Matrix - raudona = įtartinas (train)")
+ax.set_title("U-Matrix - raudona = įtartinas")
 
 ax2 = axes[1]
 ax2.hist(som_dist_train[~suspect_train], bins=40, alpha=0.6,
          color=C_LEGIT, label="Normalus", density=True)
 ax2.hist(som_dist_train[suspect_train],  bins=40, alpha=0.6,
+         color=C_FRAUD, label=f"Įtartinas (top {FRAUD_PARAMS['suspect_pct']}%)", density=True)
+ax2.axvline(threshold_dist, color="black", lw=1.5, linestyle="--",
+            label=f"Slenkstis ({threshold_dist:.2f})")
+ax2.set_title("SOM atstumo požymis\naukštas = neįprastas skelbimas")
+ax2.set_xlabel("Atstumas iki BMU")
+ax2.legend()
+
+plt.tight_layout()
+plt.show()
+
+fig, axes = plt.subplots(1, 2, figsize=FIG_WIDE)
+fig.suptitle("SOM: Klasteriai (test)", fontweight="bold")
+
+ax = axes[0]
+im = ax.imshow(som.distance_map().T, cmap="bone_r", aspect="auto")
+plt.colorbar(im, ax=ax, label="Vid. atstumas iki kaimynų")
+for x_pt, is_suspect in zip(X_test, suspect_test):
+    bmu = som.winner(x_pt)
+    ax.plot(bmu[0] + .5, bmu[1] + .5,
+            "o", color=C_FRAUD if is_suspect else C_LEGIT,
+            alpha=0.3, ms=4)
+ax.set_title("U-Matrix - raudona = įtartinas")
+
+ax2 = axes[1]
+ax2.hist(som_dist_test[~suspect_test], bins=40, alpha=0.6,
+         color=C_LEGIT, label="Normalus", density=True)
+ax2.hist(som_dist_test[suspect_test],  bins=40, alpha=0.6,
          color=C_FRAUD, label=f"Įtartinas (top {FRAUD_PARAMS['suspect_pct']}%)", density=True)
 ax2.axvline(threshold_dist, color="black", lw=1.5, linestyle="--",
             label=f"Slenkstis ({threshold_dist:.2f})")
