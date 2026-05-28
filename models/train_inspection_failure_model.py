@@ -21,6 +21,8 @@ from sklearn.linear_model import SGDClassifier
 from sklearn.metrics import classification_report, f1_score, fbeta_score, roc_auc_score
 
 THRESHOLD = 0.1
+RANKING_YEAR = 2026  # reference year used when computing age at scoring time
+
 
 @dataclass
 class TrainingMetrics:
@@ -35,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Train a model that predicts failed technical inspection risk "
-            "from vehicle label, mileage, year, fuel, and smokiness."
+            "from vehicle label, mileage, age, fuel, smokiness, and vehicle class."
         )
     )
     parser.add_argument(
@@ -91,7 +93,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Limit number of CSV chunks processed (0 means process all chunks). "
+            "Limit number of CSV chunks processed per epoch (0 means all). "
             "Useful for quick smoke tests."
         ),
     )
@@ -102,6 +104,27 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Beta value for F-beta metric. Use beta > 1 to favor recall for failing cars. "
             "Example: 2.0."
+        ),
+    )
+    parser.add_argument(
+        "--shrinkage-prior",
+        type=float,
+        default=100.0,
+        help=(
+            "Empirical-Bayes prior strength for probability smoothing. "
+            "Each model's predicted probability is blended toward the global failure rate "
+            "with this effective sample size. Higher values shrink small cohorts more. "
+            "Set to 0 to disable smoothing."
+        ),
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=3,
+        help=(
+            "Number of passes over the training data. "
+            "Epoch 1 collects the holdout set and model profiles; "
+            "subsequent epochs train on all rows to improve SGD convergence."
         ),
     )
     return parser.parse_args()
@@ -140,9 +163,16 @@ def preprocess_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
         "tp_pag_metai",
         "tp_kuras",
         "tp_dumingumas",
+        "tp_klase",
+        "ta_tipas",
+        "ta_savaites_data",
         "ar_ta_islaikyta",
     ]
     work = chunk[required_columns].copy()
+
+    # Drop re-tests: they almost always pass (driver fixed issues) and would
+    # dilute the first-time failure signal we actually care about.
+    work = work[~work["ta_tipas"].astype(str).str.contains("Pakartotina", na=False)].copy()
 
     work["vehicle_label"] = [
         build_vehicle_label(make, model)
@@ -152,6 +182,12 @@ def preprocess_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
     work["tp_pag_metai"] = pd.to_numeric(work["tp_pag_metai"], errors="coerce")
     work["tp_dumingumas"] = pd.to_numeric(work["tp_dumingumas"], errors="coerce")
     work["tp_kuras"] = work["tp_kuras"].map(normalize_text)
+    work["tp_klase"] = work["tp_klase"].map(normalize_text)
+
+    inspection_year = pd.to_datetime(work["ta_savaites_data"], errors="coerce").dt.year
+    work["car_age"] = inspection_year - work["tp_pag_metai"]
+    # Negative ages are data errors; treat as missing.
+    work.loc[work["car_age"] < 0, "car_age"] = np.nan
 
     work = work.dropna(subset=["tp_rida_km", "ar_ta_islaikyta"])
     work = work[work["tp_rida_km"] >= 0]
@@ -162,9 +198,10 @@ def preprocess_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
         [
             "vehicle_label",
             "tp_rida_km",
-            "tp_pag_metai",
+            "car_age",
             "tp_kuras",
             "tp_dumingumas",
+            "tp_klase",
             "failed",
         ]
     ]
@@ -173,29 +210,27 @@ def preprocess_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
 def to_feature_dicts(
     models: Iterable[str],
     mileages: Iterable[float],
-    years: Iterable[float],
+    ages: Iterable[float],
     fuels: Iterable[str],
     smokiness_values: Iterable[float],
+    vehicle_classes: Iterable[str],
 ) -> list[dict[str, float]]:
-    # Mileage is rescaled for numeric stability with linear models.
     feature_rows: list[dict[str, float]] = []
-    for model, mileage, year, fuel, smokiness in zip(
-        models,
-        mileages,
-        years,
-        fuels,
-        smokiness_values,
+    for model, mileage, age, fuel, smokiness, vclass in zip(
+        models, mileages, ages, fuels, smokiness_values, vehicle_classes
     ):
-        row = {
+        row: dict[str, float] = {
             f"model={model}": 1.0,
             f"fuel={fuel}": 1.0,
+            f"class={vclass}": 1.0,
+            # Mileage rescaled for numeric stability with linear models.
             "mileage_scaled": float(mileage) / 100_000.0,
         }
 
-        if pd.notna(year):
-            row["year_centered"] = (float(year) - 2000.0) / 30.0
+        if pd.notna(age):
+            row["age_scaled"] = float(age) / 40.0
         else:
-            row["year_missing"] = 1.0
+            row["age_missing"] = 1.0
 
         if pd.notna(smokiness):
             row["smokiness_scaled"] = float(smokiness) / 100.0
@@ -207,9 +242,29 @@ def to_feature_dicts(
     return feature_rows
 
 
+def _open_chunks(args: argparse.Namespace):
+    return pd.read_csv(
+        args.csv_path,
+        usecols=[
+            "tp_marke",
+            "tp_modelis",
+            "tp_rida_km",
+            "tp_pag_metai",
+            "tp_kuras",
+            "tp_dumingumas",
+            "tp_klase",
+            "ta_tipas",
+            "ta_savaites_data",
+            "ar_ta_islaikyta",
+        ],
+        chunksize=args.chunk_size,
+        low_memory=True,
+    )
+
+
 def train_incremental_model(
     args: argparse.Namespace,
-) -> tuple[FeatureHasher, SGDClassifier, Counter, dict[str, dict[str, Union[float, str]]], TrainingMetrics]:
+) -> tuple[FeatureHasher, SGDClassifier, Counter, dict[str, dict[str, Union[float, str]]], TrainingMetrics, float]:
     hasher = FeatureHasher(n_features=2**18, input_type="dict", alternate_sign=False)
     classifier = SGDClassifier(
         loss="log_loss",
@@ -221,6 +276,7 @@ def train_incremental_model(
     rng = np.random.default_rng(args.random_state)
     model_counts: Counter = Counter()
     model_fuel_counts: dict[str, Counter] = defaultdict(Counter)
+    model_class_counts: dict[str, Counter] = defaultdict(Counter)
     model_year_sums: dict[str, float] = defaultdict(float)
     model_year_counts: dict[str, int] = defaultdict(int)
     model_smoke_sums: dict[str, float] = defaultdict(float)
@@ -231,114 +287,130 @@ def train_incremental_model(
 
     total_rows = 0
     trained_rows = 0
-
-    chunks = pd.read_csv(
-        args.csv_path,
-        usecols=[
-            "tp_marke",
-            "tp_modelis",
-            "tp_rida_km",
-            "tp_pag_metai",
-            "tp_kuras",
-            "tp_dumingumas",
-            "ar_ta_islaikyta",
-        ],
-        chunksize=args.chunk_size,
-        low_memory=True,
-    )
-
+    total_failures = 0
+    total_labeled = 0
     first_fit_done = False
 
-    for chunk_idx, chunk in enumerate(chunks, start=1):
-        if args.max_chunks > 0 and chunk_idx > args.max_chunks:
-            break
+    for epoch in range(args.epochs):
+        is_first_epoch = epoch == 0
+        epoch_rows = 0
 
-        processed = preprocess_chunk(chunk)
-        if processed.empty:
-            continue
+        for chunk_idx, chunk in enumerate(_open_chunks(args), start=1):
+            if args.max_chunks > 0 and chunk_idx > args.max_chunks:
+                break
 
-        n_rows = len(processed)
-        total_rows += n_rows
-        model_counts.update(processed["vehicle_label"].tolist())
+            processed = preprocess_chunk(chunk)
+            if processed.empty:
+                continue
 
-        for model, fuel in zip(processed["vehicle_label"], processed["tp_kuras"]):
-            model_fuel_counts[model][fuel] += 1
+            n_rows = len(processed)
+            epoch_rows += n_rows
 
-        year_rows = processed.dropna(subset=["tp_pag_metai"])[["vehicle_label", "tp_pag_metai"]]
-        for model, year in year_rows.itertuples(index=False):
-            model_year_sums[model] += float(year)
-            model_year_counts[model] += 1
+            # Collect profiles and global stats only on the first epoch.
+            if is_first_epoch:
+                total_rows += n_rows
+                total_failures += int(processed["failed"].sum())
+                total_labeled += n_rows
+                model_counts.update(processed["vehicle_label"].tolist())
 
-        smoke_rows = processed.dropna(subset=["tp_dumingumas"])[["vehicle_label", "tp_dumingumas"]]
-        for model, smoke in smoke_rows.itertuples(index=False):
-            model_smoke_sums[model] += float(smoke)
-            model_smoke_counts[model] += 1
+                for model, fuel in zip(processed["vehicle_label"], processed["tp_kuras"]):
+                    model_fuel_counts[model][fuel] += 1
 
-        eval_quota_remaining = max(0, args.max_eval_rows - len(eval_labels))
-        if eval_quota_remaining > 0:
-            eval_fraction = min(0.12, eval_quota_remaining / max(n_rows, 1))
-            eval_mask = rng.random(n_rows) < eval_fraction
-        else:
-            eval_mask = np.zeros(n_rows, dtype=bool)
+                for model, vclass in zip(processed["vehicle_label"], processed["tp_klase"]):
+                    model_class_counts[model][vclass] += 1
 
-        train_mask = ~eval_mask
+                # Store manufacture year via car_age back-computation is lossy;
+                # re-read tp_pag_metai from the raw chunk for profiles.
+                mfr_year = pd.to_numeric(chunk["tp_pag_metai"], errors="coerce")
+                valid_year_mask = mfr_year.notna()
+                for model, year in zip(
+                    processed["vehicle_label"],
+                    mfr_year.reindex(processed.index).where(valid_year_mask.reindex(processed.index, fill_value=False)),
+                ):
+                    if pd.notna(year):
+                        model_year_sums[model] += float(year)
+                        model_year_counts[model] += 1
 
-        if eval_mask.any():
-            eval_chunk = processed.loc[eval_mask]
-            eval_features.extend(
-                to_feature_dicts(
-                    eval_chunk["vehicle_label"],
-                    eval_chunk["tp_rida_km"],
-                    eval_chunk["tp_pag_metai"],
-                    eval_chunk["tp_kuras"],
-                    eval_chunk["tp_dumingumas"],
-                )
-            )
-            eval_labels.extend(eval_chunk["failed"].astype(int).tolist())
+                smoke_rows = processed.dropna(subset=["tp_dumingumas"])[["vehicle_label", "tp_dumingumas"]]
+                for model, smoke in smoke_rows.itertuples(index=False):
+                    model_smoke_sums[model] += float(smoke)
+                    model_smoke_counts[model] += 1
 
-        if train_mask.any():
-            train_chunk = processed.loc[train_mask]
-            x_train = hasher.transform(
-                to_feature_dicts(
-                    train_chunk["vehicle_label"],
-                    train_chunk["tp_rida_km"],
-                    train_chunk["tp_pag_metai"],
-                    train_chunk["tp_kuras"],
-                    train_chunk["tp_dumingumas"],
-                )
-            )
-            y_train = train_chunk["failed"].astype(int).to_numpy()
-
-            # Approximate balanced training for streamed chunks.
-            # This keeps rare failure rows influential without loading full data.
-            pos_count = int((y_train == 1).sum())
-            neg_count = int((y_train == 0).sum())
-            total = max(pos_count + neg_count, 1)
-            if pos_count > 0 and neg_count > 0:
-                weight_pos = total / (2.0 * pos_count)
-                weight_neg = total / (2.0 * neg_count)
-                sample_weight = np.where(y_train == 1, weight_pos, weight_neg)
+            # Holdout split only on first epoch; subsequent epochs train on everything.
+            if is_first_epoch:
+                eval_quota_remaining = max(0, args.max_eval_rows - len(eval_labels))
+                if eval_quota_remaining > 0:
+                    eval_fraction = min(0.12, eval_quota_remaining / max(n_rows, 1))
+                    eval_mask = rng.random(n_rows) < eval_fraction
+                else:
+                    eval_mask = np.zeros(n_rows, dtype=bool)
+                train_mask = ~eval_mask
             else:
-                sample_weight = np.ones_like(y_train, dtype=float)
+                eval_mask = np.zeros(n_rows, dtype=bool)
+                train_mask = np.ones(n_rows, dtype=bool)
 
-            if not first_fit_done:
-                classifier.partial_fit(
-                    x_train,
-                    y_train,
-                    classes=np.array([0, 1]),
-                    sample_weight=sample_weight,
+            if is_first_epoch and eval_mask.any():
+                eval_chunk = processed.loc[eval_mask]
+                eval_features.extend(
+                    to_feature_dicts(
+                        eval_chunk["vehicle_label"],
+                        eval_chunk["tp_rida_km"],
+                        eval_chunk["car_age"],
+                        eval_chunk["tp_kuras"],
+                        eval_chunk["tp_dumingumas"],
+                        eval_chunk["tp_klase"],
+                    )
                 )
-                first_fit_done = True
-            else:
-                classifier.partial_fit(x_train, y_train, sample_weight=sample_weight)
+                eval_labels.extend(eval_chunk["failed"].astype(int).tolist())
 
-            trained_rows += len(train_chunk)
+            if train_mask.any():
+                train_chunk = processed.loc[train_mask]
+                x_train = hasher.transform(
+                    to_feature_dicts(
+                        train_chunk["vehicle_label"],
+                        train_chunk["tp_rida_km"],
+                        train_chunk["car_age"],
+                        train_chunk["tp_kuras"],
+                        train_chunk["tp_dumingumas"],
+                        train_chunk["tp_klase"],
+                    )
+                )
+                y_train = train_chunk["failed"].astype(int).to_numpy()
 
-        if chunk_idx % 20 == 0:
-            print(
-                f"Processed chunks: {chunk_idx}, rows seen: {total_rows:,}, "
-                f"rows used for training: {trained_rows:,}, holdout size: {len(eval_labels):,}"
-            )
+                # Approximate balanced training for streamed chunks.
+                # This keeps rare failure rows influential without loading full data.
+                pos_count = int((y_train == 1).sum())
+                neg_count = int((y_train == 0).sum())
+                total = max(pos_count + neg_count, 1)
+                if pos_count > 0 and neg_count > 0:
+                    weight_pos = total / (2.0 * pos_count)
+                    weight_neg = total / (2.0 * neg_count)
+                    sample_weight = np.where(y_train == 1, weight_pos, weight_neg)
+                else:
+                    sample_weight = np.ones_like(y_train, dtype=float)
+
+                if not first_fit_done:
+                    classifier.partial_fit(
+                        x_train,
+                        y_train,
+                        classes=np.array([0, 1]),
+                        sample_weight=sample_weight,
+                    )
+                    first_fit_done = True
+                else:
+                    classifier.partial_fit(x_train, y_train, sample_weight=sample_weight)
+
+                trained_rows += len(train_chunk)
+
+            if chunk_idx % 20 == 0:
+                print(
+                    f"Epoch {epoch + 1}/{args.epochs} — chunk {chunk_idx}, "
+                    f"rows seen this epoch: {epoch_rows:,}, "
+                    f"total trained rows: {trained_rows:,}, "
+                    f"holdout size: {len(eval_labels):,}"
+                )
+
+        print(f"Epoch {epoch + 1}/{args.epochs} complete — {epoch_rows:,} rows processed.")
 
     if not first_fit_done:
         raise RuntimeError("Training did not run; no usable rows found in dataset.")
@@ -350,7 +422,6 @@ def train_incremental_model(
     y_eval = np.array(eval_labels)
 
     fail_scores = classifier.predict_proba(x_eval)[:, 1]
-    # Guard against single-class evaluation data, which makes ROC AUC undefined.
     unique_classes = np.unique(y_eval)
     if unique_classes.size < 2:
         print(
@@ -371,6 +442,7 @@ def train_incremental_model(
         if count <= 0:
             continue
         top_fuel = model_fuel_counts[model].most_common(1)[0][0] if model_fuel_counts[model] else "UNKNOWN"
+        top_class = model_class_counts[model].most_common(1)[0][0] if model_class_counts[model] else "UNKNOWN"
         avg_year = (
             model_year_sums[model] / model_year_counts[model]
             if model_year_counts[model] > 0
@@ -383,9 +455,12 @@ def train_incremental_model(
         )
         model_profiles[model] = {
             "fuel": top_fuel,
+            "class": top_class,
             "year": float(avg_year) if pd.notna(avg_year) else np.nan,
             "smokiness": float(avg_smokiness) if pd.notna(avg_smokiness) else np.nan,
         }
+
+    global_failure_rate = total_failures / total_labeled if total_labeled > 0 else 0.5
 
     metrics = TrainingMetrics(
         roc_auc=roc_auc,
@@ -394,7 +469,7 @@ def train_incremental_model(
         beta=args.fbeta_beta,
         report_text=report_text,
     )
-    return hasher, classifier, model_counts, model_profiles, metrics
+    return hasher, classifier, model_counts, model_profiles, metrics, global_failure_rate
 
 
 def build_risk_ranking(
@@ -404,6 +479,8 @@ def build_risk_ranking(
     model_profiles: dict[str, dict[str, Union[float, str]]],
     min_model_count: int,
     top_model_limit: int,
+    global_failure_rate: float = 0.5,
+    shrinkage_prior: float = 100.0,
 ) -> pd.DataFrame:
     mileage_grid = [50_000, 100_000, 150_000, 200_000, 250_000, 300_000, 400_000]
 
@@ -422,18 +499,27 @@ def build_risk_ranking(
     for model in candidate_models:
         profile = model_profiles.get(model, {})
         default_fuel = str(profile.get("fuel", "UNKNOWN"))
-        default_year = profile.get("year", np.nan)
+        default_class = str(profile.get("class", "UNKNOWN"))
+        avg_year = profile.get("year", np.nan)
+        default_age = (float(RANKING_YEAR) - float(avg_year)) if pd.notna(avg_year) else np.nan
         default_smokiness = profile.get("smokiness", np.nan)
+
         for mileage in mileage_grid:
             features = to_feature_dicts(
                 [model],
                 [mileage],
-                [default_year],
+                [default_age],
                 [default_fuel],
                 [default_smokiness],
+                [default_class],
             )
             x = hasher.transform(features)
-            fail_probability = float(classifier.predict_proba(x)[0, 1])
+            raw_prob = float(classifier.predict_proba(x)[0, 1])
+            if shrinkage_prior > 0:
+                n = model_counts[model]
+                fail_probability = (n * raw_prob + shrinkage_prior * global_failure_rate) / (n + shrinkage_prior)
+            else:
+                fail_probability = raw_prob
             records.append(
                 {
                     "vehicle_label": model,
@@ -469,7 +555,7 @@ def main() -> None:
     args.output_model.parent.mkdir(parents=True, exist_ok=True)
     args.output_risk_report.parent.mkdir(parents=True, exist_ok=True)
 
-    hasher, classifier, model_counts, model_profiles, metrics = train_incremental_model(args)
+    hasher, classifier, model_counts, model_profiles, metrics, global_failure_rate = train_incremental_model(args)
 
     artifact = {
         "feature_hasher": hasher,
@@ -482,15 +568,19 @@ def main() -> None:
                 "tp_pag_metai",
                 "tp_kuras",
                 "tp_dumingumas",
+                "tp_klase",
+                "ta_tipas",
+                "ta_savaites_data",
             ],
             "target_column": "failed",
-            "fail_definition": "failed = not ar_ta_islaikyta",
+            "fail_definition": "failed = not ar_ta_islaikyta (first-time inspections only)",
             "model_type": "SGDClassifier(log_loss)",
             "decision_threshold": THRESHOLD,
         },
     }
     joblib.dump(artifact, args.output_model)
 
+    print(f"\nGlobal first-time failure rate: {global_failure_rate:.4f}")
     risk_df = build_risk_ranking(
         hasher,
         classifier,
@@ -498,6 +588,8 @@ def main() -> None:
         model_profiles,
         min_model_count=args.min_model_count,
         top_model_limit=args.top_model_limit,
+        global_failure_rate=global_failure_rate,
+        shrinkage_prior=args.shrinkage_prior,
     )
     risk_df.to_csv(args.output_risk_report, index=False)
 

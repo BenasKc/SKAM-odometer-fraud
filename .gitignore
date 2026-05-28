@@ -1,3 +1,14 @@
+# Raw data (large)
 /data/*
+
+# Generated model artifacts
 models/high_risk_model_mileage_pairs.csv
 models/inspection_failure_model.joblib
+models/price_regression_model.joblib
+
+# Generated datasets
+models/autoplius_cars_cleaned.csv
+models/autoplius_cars_som_enriched.csv
+
+# Virtual environment
+.venv/
